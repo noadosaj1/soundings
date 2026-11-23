@@ -276,9 +276,11 @@ test("legacy daily dives migrate into the history when the database is reopened"
   await db.prepare("INSERT INTO players (id, created_at) VALUES ('old', 0)").run();
   await db.prepare("INSERT INTO sessions (day, player, phase, idx, seq, score, started_at, finished_at) VALUES (300, 'old', 'done', 6, 9, 120, 1, 2)").run();
   await db.prepare("INSERT INTO rounds (day, player, n, qid, started_at, deadline, status, points) VALUES (300, 'old', 0, 'planets', 1, 2, 'passed', 0)").run();
+  await db.prepare("DROP TABLE meta").run();          // a database from before schema versioning
   db.close();
   const reopened = await openDb(file);                 // migration runs on open
   (await openDb(file)).close();                        // and is idempotent
+  assert.equal((await reopened.prepare("SELECT v FROM meta WHERE k = 'schema'").get()).v, "1", "version recorded, so later opens skip migration");
   const game = createGame({ db: reopened, bank });
   const h = (await game.history("old")).dives;
   assert.equal(h.length, 1); assert.equal(h[0].modeName, "Daily Dive (legacy)"); assert.equal(h[0].score, 120); assert.equal(h[0].questions, 1);

@@ -18,7 +18,7 @@ const randomHex = bytes => crypto.randomBytes(bytes).toString("hex");
 
 function createAuth(db, { now = () => Date.now(), secure = false } = {}) {
   const sql = {
-    token:      db.prepare("SELECT player FROM auth_tokens WHERE token_hash = ?"),
+    token:      db.prepare("SELECT player, last_seen FROM auth_tokens WHERE token_hash = ?"),
     touch:      db.prepare("UPDATE auth_tokens SET last_seen = ? WHERE token_hash = ?"),
     addToken:   db.prepare("INSERT INTO auth_tokens (token_hash, player, created_at, last_seen) VALUES (?, ?, ?, ?)"),
     player:     db.prepare("SELECT id, account_id FROM players WHERE id = ?"),
@@ -40,7 +40,8 @@ function createAuth(db, { now = () => Date.now(), secure = false } = {}) {
     if (!token) return null;
     const h = sha256(token), t = now();
     const row = await sql.token.get(h);
-    if (row) { await sql.touch.run(t, h); return row.player; }
+    // last_seen only needs hour precision; skipping the write saves a database round trip per request
+    if (row) { if (t - row.last_seen > 3_600_000) await sql.touch.run(t, h); return row.player; }
     if (await sql.player.get(token)) { await sql.addToken.run(h, token, t, t); return token; }   // legacy cookie
     return null;
   }

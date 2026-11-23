@@ -250,9 +250,10 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     const empty = { dives: 0, questionsAnswered: 0, accepted: 0, passed: 0, timedOut: 0, answeredRate: 0, bestScore: 0, deepest: 0,
       average: 0, totalPoints: 0, tierCounts: {}, tiersFound: [], rarest: null, favoriteTopics: [], records: {}, recent: [] };
     if (!pid) return empty;
-    const done = (await sql.finished.all(pid));
-    const st = Object.fromEntries((await sql.statusCounts.all(pid)).map(r => [r.status, r.n]));
-    const tierCounts = Object.fromEntries((await sql.tierCounts.all(pid)).filter(r => r.tier).map(r => [r.tier, r.n]));
+    // independent reads run in parallel: on a remote database each one is a network round trip
+    const [done, stRows, tierRows, rr] = await Promise.all([sql.finished.all(pid), sql.statusCounts.all(pid), sql.tierCounts.all(pid), sql.rarest.get(pid)]);
+    const st = Object.fromEntries(stRows.map(r => [r.status, r.n]));
+    const tierCounts = Object.fromEntries(tierRows.filter(r => r.tier).map(r => [r.tier, r.n]));
     const answered = (st.accepted || 0) + (st.passed || 0) + (st.timeout || 0);
     const sevens = done.filter(d => d.mode !== "endless");
     const records = {};
@@ -266,7 +267,6 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     for (const d of done) if (d.topic) { const x = byTopic[d.topic] ??= { topic: d.topic, name: topicName(d.topic), dives: 0, total: 0, best: 0 }; x.dives++; x.total += d.score; x.best = Math.max(x.best, d.score); }
     const favoriteTopics = Object.values(byTopic).map(x => ({ ...x, average: Math.round(x.total / x.dives) }))
       .sort((a, b) => b.dives - a.dives || b.total - a.total).slice(0, 3);
-    const rr = (await sql.rarest.get(pid));
     let rarest = null;
     if (rr) { const q = questions.get(rr.qid), e = q && catalogs.get(rr.qid).byId.get(rr.answer_id);
       rarest = { answer: e ? e.name : rr.answer_raw, question: q ? q.text : "", tier: rr.tier, points: rr.points, share: rr.share, dive: rr.dive }; }
@@ -297,11 +297,11 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     if (pid && diveId) d = await ownDive(pid, diveId);
     else if (pid) d = (await sql.active.get(pid)) || null;
     d = await settle(d, t);
+    const [topics, player, dive] = await Promise.all([topicsInfo(), playerStats(pid), d ? diveView(d) : null]);
     return {
       serverNow: t, metresPerPoint: E.METRES_PER_POINT, graceMs: E.GRACE_MS,
       tiers: E.TIERS.map(({ id, name, points, creature }) => ({ id, name, points, creature })),
-      zones: E.ZONES, groups: GROUPS, topics: await topicsInfo(), modes: Object.values(MODES),
-      player: await playerStats(pid), dive: d ? await diveView(d) : null,
+      zones: E.ZONES, groups: GROUPS, topics, modes: Object.values(MODES), player, dive,
     };
   }
 

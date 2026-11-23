@@ -218,14 +218,26 @@ async function openDb(target = ":memory:", { authToken } = {}) {
   };
 
   if (!remote && target !== ":memory:") await client.execute("PRAGMA journal_mode = WAL");
-  await client.execute("PRAGMA foreign_keys = ON");
-  await db.exec(SCHEMA);
-  // additive migration for databases created before accounts existed
-  const cols = (await db.prepare("PRAGMA table_info(players)").all()).map(c => c.name);
-  if (!cols.includes("account_id")) await db.exec("ALTER TABLE players ADD COLUMN account_id TEXT REFERENCES accounts(id)");
-  // one-time carry-over of finished daily dives into the unlimited dive history
-  await db.exec(MIGRATE_LEGACY);
+  if (!remote) await client.execute("PRAGMA foreign_keys = ON");
+  // Schema work runs once per database, not on every serverless cold start: a single query
+  // tells whether this database is already at SCHEMA_VERSION.
+  if ((await schemaVersion(client)) < SCHEMA_VERSION) {
+    await db.exec(SCHEMA);
+    // additive migration for databases created before accounts existed
+    const cols = (await db.prepare("PRAGMA table_info(players)").all()).map(c => c.name);
+    if (!cols.includes("account_id")) await db.exec("ALTER TABLE players ADD COLUMN account_id TEXT REFERENCES accounts(id)");
+    // one-time carry-over of finished daily dives into the unlimited dive history
+    await db.exec(MIGRATE_LEGACY);
+    await db.exec(`CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+      INSERT OR REPLACE INTO meta (k, v) VALUES ('schema', '${SCHEMA_VERSION}');`);
+  }
   return db;
+}
+
+const SCHEMA_VERSION = 1;   // bump when SCHEMA or the migrations above change
+async function schemaVersion(client) {
+  try { return Number((await client.execute("SELECT v FROM meta WHERE k = 'schema'")).rows[0]?.v) || 0; }
+  catch { return 0; }   // no meta table yet
 }
 
 module.exports = { openDb };
