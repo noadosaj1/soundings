@@ -1,0 +1,18 @@
+{
+  "name": "soundings",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Soundings: a daily dive-deep trivia game with rarity scoring.",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server/server.js",
+    "test:unit": "node --test test/engine.test.js",
+    "test:e2e": "node test/e2e.js",
+    "test": "npm run test:unit && npm run test:e2e",
+    "build:freq": "node scripts/build-freq.js"
+  },
+  "devDependencies": {
+    "@msgpack/msgpack": "^3.1.3",
+    "playwright": "^1.49.1"
+  }
+}
