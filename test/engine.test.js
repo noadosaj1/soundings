@@ -123,177 +123,188 @@ test("picker: mixed uses 7 different topics; special rises in difficulty; endles
 });
 
 // ---------- game service ----------
-function setup(t0 = Date.UTC(2026, 10, 20, 12)) {
+async function setup(t0 = Date.UTC(2026, 10, 20, 12)) {
   let t = t0;
-  const db = openDb(":memory:");
+  const db = await openDb(":memory:");
   const game = createGame({ db, bank, now: () => t, random: seq(11) });
   const mk = db.prepare("INSERT OR IGNORE INTO players (id, created_at) VALUES (?, 0)");
   const start = game.start;
-  game.start = (pid, o) => { mk.run(pid); return start(pid, o); };
+  game.start = async (pid, o) => { await mk.run(pid); return start(pid, o); };
   return { game, db, tick: ms => { t += ms; } };
 }
 const commonFor = v => cat(bank.find(q => q.text === v.dive.log[v.dive.idx].text).id).entries[0].name;
-const err = (fn, code) => assert.throws(fn, e => e instanceof GameError && e.code === code);
-function play(game, pid, opts, how = "answer") {
-  let v = game.start(pid, opts);
+const err = (p, code) => assert.rejects(p, e => e instanceof GameError && e.code === code);
+async function play(game, pid, opts, how = "answer") {
+  let v = await game.start(pid, opts);
   while (v.dive.phase !== "done") {
-    v = how === "answer" ? game.answer(pid, { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) }) : game.pass(pid, { dive: v.dive.id, seq: v.dive.seq });
-    v = game.next(pid, { dive: v.dive.id, seq: v.dive.seq });
+    v = how === "answer" ? await game.answer(pid, { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) }) : await game.pass(pid, { dive: v.dive.id, seq: v.dive.seq });
+    v = await game.next(pid, { dive: v.dive.id, seq: v.dive.seq });
   }
   return v;
 }
 
-test("unlimited: finish a dive, start another immediately, again and again", () => {
-  const { game } = setup();
+test("unlimited: finish a dive, start another immediately, again and again", async () => {
+  const { game } = await setup();
   const ids = new Set();
-  for (let i = 0; i < 4; i++) { const v = play(game, "p", { mode: "quick", topic: i % 2 ? "space" : "movies" }); assert.equal(v.dive.phase, "done"); ids.add(v.dive.id); }
+  for (let i = 0; i < 4; i++) { const v = await play(game, "p", { mode: "quick", topic: i % 2 ? "space" : "movies" }); assert.equal(v.dive.phase, "done"); ids.add(v.dive.id); }
   assert.equal(ids.size, 4, "every dive has its own id");
-  assert.equal(game.state("p").player.dives, 4);
+  assert.equal((await game.state("p")).player.dives, 4);
 });
 
-test("a dive: reject, retry, accept, pass, timeout; score and depth from recorded rounds", () => {
-  const { game, tick } = setup();
-  let v = game.start("p", { mode: "quick", topic: "geography" });
-  v = game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: "definitely not an answer" });
+test("a dive: reject, retry, accept, pass, timeout; score and depth from recorded rounds", async () => {
+  const { game, tick } = await setup();
+  let v = await game.start("p", { mode: "quick", topic: "geography" });
+  v = await game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: "definitely not an answer" });
   assert.equal(v.result.outcome, "rejected");
-  v = game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) });
+  v = await game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) });
   assert.equal(v.result.outcome, "accepted");
-  err(() => game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: "x" }), "closed");
-  v = game.next("p", { dive: v.dive.id, seq: v.dive.seq });
-  v = game.pass("p", { dive: v.dive.id, seq: v.dive.seq });
-  v = game.next("p", { dive: v.dive.id, seq: v.dive.seq });
+  await err(game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: "x" }), "closed");
+  v = await game.next("p", { dive: v.dive.id, seq: v.dive.seq });
+  v = await game.pass("p", { dive: v.dive.id, seq: v.dive.seq });
+  v = await game.next("p", { dive: v.dive.id, seq: v.dive.seq });
   tick(MODES.quick.questionMs + E.GRACE_MS + 1);
-  v = game.state("p");
+  v = await game.state("p");
   assert.equal(v.dive.log[2].status, "timeout");
   assert.ok(v.dive.log[0].explain, "closed rounds carry the explanation");
   const sum = v.dive.log.reduce((s, r) => s + (r.points || 0), 0);
   assert.equal(v.dive.score, sum); assert.equal(v.dive.depth, sum * 10);
 });
 
-test("replays and other players' dives are refused", () => {
-  const { game } = setup();
-  let v = game.start("p", { mode: "mixed" });
+test("replays and other players' dives are refused", async () => {
+  const { game } = await setup();
+  let v = await game.start("p", { mode: "mixed" });
   const s0 = v.dive.seq;
-  v = game.answer("p", { dive: v.dive.id, seq: s0, text: commonFor(v) });
-  err(() => game.answer("p", { dive: v.dive.id, seq: s0, text: "again" }), "stale");
-  game.start("q", { mode: "mixed" });
-  err(() => game.next("q", { dive: v.dive.id, seq: v.dive.seq }), "no-dive");
-  err(() => game.review("q", v.dive.id), "no-dive");
+  v = await game.answer("p", { dive: v.dive.id, seq: s0, text: commonFor(v) });
+  await err(game.answer("p", { dive: v.dive.id, seq: s0, text: "again" }), "stale");
+  await game.start("q", { mode: "mixed" });
+  await err(game.next("q", { dive: v.dive.id, seq: v.dive.seq }), "no-dive");
+  await err(game.review("q", v.dive.id), "no-dive");
 });
 
-test("starting a new dive abandons the unfinished one; abandoned dives stay out of stats", () => {
-  const { game } = setup();
-  const a = game.start("p", { mode: "quick", topic: "art" });
-  const b = game.start("p", { mode: "quick", topic: "music" });
-  err(() => game.answer("p", { dive: a.dive.id, seq: a.dive.seq, text: "x" }), "stale");
-  assert.equal(game.state("p").dive.id, b.dive.id);
-  assert.equal(game.history("p").dives.length, 0);
-  assert.equal(game.state("p").player.timedOut, 0);
+test("starting a new dive abandons the unfinished one; abandoned dives stay out of stats", async () => {
+  const { game } = await setup();
+  const a = await game.start("p", { mode: "quick", topic: "art" });
+  const b = await game.start("p", { mode: "quick", topic: "music" });
+  await err(game.answer("p", { dive: a.dive.id, seq: a.dive.seq, text: "x" }), "stale");
+  assert.equal((await game.state("p")).dive.id, b.dive.id);
+  assert.equal((await game.history("p")).dives.length, 0);
+  assert.equal((await game.state("p")).player.timedOut, 0);
 });
 
-test("no repeats within a dive and recently played questions are avoided", () => {
-  const { game } = setup();
-  const first = play(game, "p", { mode: "quick", topic: "music" });
-  const second = play(game, "p", { mode: "quick", topic: "music" });
+test("no repeats within a dive and recently played questions are avoided", async () => {
+  const { game } = await setup();
+  const first = await play(game, "p", { mode: "quick", topic: "music" });
+  const second = await play(game, "p", { mode: "quick", topic: "music" });
   for (const v of [first, second]) assert.equal(new Set(v.dive.log.map(r => r.text)).size, 7);
   for (const r of second.dive.log) assert.ok(!first.dive.log.some(f => f.text === r.text), "repeated from last dive: " + r.text);
 });
 
-test("topic special: escalating difficulty, 30 s timer, mastery rank", () => {
-  const { game } = setup();
-  const v = play(game, "p", { mode: "special", topic: "dinosaurs" });
+test("topic special: escalating difficulty, 30 s timer, mastery rank", async () => {
+  const { game } = await setup();
+  const v = await play(game, "p", { mode: "special", topic: "dinosaurs" });
   const d = v.dive.log.map(r => E.DIFFICULTY[r.difficulty]);
   assert.deepEqual(d, [...d].sort((a, b) => a - b));
   assert.equal(v.dive.questionMs, 30000);
   assert.equal(v.dive.mastery, "Abyss master");
 });
 
-test("endless: three air tanks, passes cost one, surfacing keeps the score", () => {
-  const { game } = setup();
-  const out = play(game, "p", { mode: "endless" }, "pass");
+test("endless: three air tanks, passes cost one, surfacing keeps the score", async () => {
+  const { game } = await setup();
+  const out = await play(game, "p", { mode: "endless" }, "pass");
   assert.equal(out.dive.endReason, "out-of-air"); assert.equal(out.dive.log.length, 3);
-  let v = game.start("p", { mode: "endless", topic: "space" });
+  let v = await game.start("p", { mode: "endless", topic: "space" });
   const n = bank.filter(q => q.topic === "space").length;
-  for (let i = 0; i < n + 2; i++) { v = game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) }); v = game.next("p", { dive: v.dive.id, seq: v.dive.seq }); }
+  for (let i = 0; i < n + 2; i++) { v = await game.answer("p", { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) }); v = await game.next("p", { dive: v.dive.id, seq: v.dive.seq }); }
   assert.equal(v.dive.lives, 3); assert.equal(v.dive.log.length, n + 3);
   assert.ok(v.dive.log.slice(0, n).every(r => r.topic === "space"), "chosen topic first");
   assert.ok(v.dive.log.slice(n).every(r => r.topic !== "space"), "then other topics");
   const score = v.dive.score;
-  v = game.surface("p", { dive: v.dive.id, seq: v.dive.seq });
+  v = await game.surface("p", { dive: v.dive.id, seq: v.dive.seq });
   assert.equal(v.dive.phase, "done"); assert.equal(v.dive.endReason, "surfaced"); assert.equal(v.dive.score, score);
-  err(() => game.surface("p", { dive: play(game, "p", { mode: "quick", topic: "art" }).dive.id, seq: 99 }), "stale");
+  const quick = await play(game, "p", { mode: "quick", topic: "art" });
+  await err(game.surface("p", { dive: quick.dive.id, seq: 99 }), "stale");
 });
 
-test("invalid modes and topics are refused", () => {
-  const { game } = setup();
-  err(() => game.start("p", { mode: "daily" }), "bad-mode");
-  err(() => game.start("p", { mode: "quick" }), "bad-topic");
-  err(() => game.start("p", { mode: "special", topic: "nope" }), "bad-topic");
+test("invalid modes and topics are refused", async () => {
+  const { game } = await setup();
+  await err(game.start("p", { mode: "daily" }), "bad-mode");
+  await err(game.start("p", { mode: "quick" }), "bad-topic");
+  await err(game.start("p", { mode: "special", topic: "nope" }), "bad-topic");
 });
 
-test("permanent stats, records, favourite topics, rarest answer, history and review", () => {
-  const { game } = setup();
-  play(game, "p", { mode: "quick", topic: "space" });
-  play(game, "p", { mode: "quick", topic: "space" });
-  play(game, "p", { mode: "mixed" });
-  play(game, "p", { mode: "endless", topic: "art" }, "pass");
-  const s = game.state("p").player;
+test("permanent stats, records, favourite topics, rarest answer, history and review", async () => {
+  const { game } = await setup();
+  await play(game, "p", { mode: "quick", topic: "space" });
+  await play(game, "p", { mode: "quick", topic: "space" });
+  await play(game, "p", { mode: "mixed" });
+  await play(game, "p", { mode: "endless", topic: "art" }, "pass");
+  const s = (await game.state("p")).player;
   assert.equal(s.dives, 4);
   assert.equal(s.questionsAnswered, 7 * 3 + 3);
   assert.equal(s.favoriteTopics[0].topic, "space");
   assert.ok(s.records.quick.bestScore > 0 && s.records.endless.longestRun === 3);
   assert.ok(s.rarest && s.rarest.answer && s.rarest.question);
   assert.equal(s.deepest, s.bestScore * 10);
-  const h = game.history("p").dives;
+  const h = (await game.history("p")).dives;
   assert.equal(h.length, 4);
-  const r = game.review("p", h[0].id);
+  const r = await game.review("p", h[0].id);
   assert.equal(r.dive.id, h[0].id); assert.ok(r.dive.log.every(x => x.status !== "open"));
 });
 
-test("rarity snapshot is shared by everyone on the same question that day", () => {
-  const { game } = setup();
+test("rarity snapshot is shared by everyone on the same question that day", async () => {
+  const { game } = await setup();
   const qid = "planets";
-  const shares = ["a", "b", "c"].map(p => {
+  const shares = [];
+  for (const p of ["a", "b", "c"]) {
     // the question may not come up in the first dive; new dives prefer unseen questions, so it soon does
     const at = v => bank.find(q => q.text === v.dive.log[v.dive.idx].text).id === qid;
     let v;
     for (let tries = 0; tries < 10 && !(v && at(v)); tries++) {
-      v = game.start(p, { mode: "quick", topic: "space" });
-      while (!at(v) && v.dive.idx < 6) { v = game.pass(p, { dive: v.dive.id, seq: v.dive.seq }); v = game.next(p, { dive: v.dive.id, seq: v.dive.seq }); }
+      v = await game.start(p, { mode: "quick", topic: "space" });
+      while (!at(v) && v.dive.idx < 6) { v = await game.pass(p, { dive: v.dive.id, seq: v.dive.seq }); v = await game.next(p, { dive: v.dive.id, seq: v.dive.seq }); }
     }
     assert.ok(at(v), "question never came up");
-    return game.answer(p, { dive: v.dive.id, seq: v.dive.seq, text: "Mars" }).dive.log[v.dive.idx].share;
-  });
+    shares.push((await game.answer(p, { dive: v.dive.id, seq: v.dive.seq, text: "Mars" })).dive.log[v.dive.idx].share);
+  }
   assert.equal(new Set(shares).size, 1);
 });
 
-test("legacy daily dives migrate into the history when the database is reopened", () => {
+test("legacy daily dives migrate into the history when the database is reopened", async () => {
   const fs = require("node:fs"), os = require("node:os"), path = require("node:path");
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "snd-")), "legacy.db");
-  const db = openDb(file);
-  db.prepare("INSERT INTO players (id, created_at) VALUES ('old', 0)").run();
-  db.prepare("INSERT INTO sessions (day, player, phase, idx, seq, score, started_at, finished_at) VALUES (300, 'old', 'done', 6, 9, 120, 1, 2)").run();
-  db.prepare("INSERT INTO rounds (day, player, n, qid, started_at, deadline, status, points) VALUES (300, 'old', 0, 'planets', 1, 2, 'passed', 0)").run();
+  const db = await openDb(file);
+  await db.prepare("INSERT INTO players (id, created_at) VALUES ('old', 0)").run();
+  await db.prepare("INSERT INTO sessions (day, player, phase, idx, seq, score, started_at, finished_at) VALUES (300, 'old', 'done', 6, 9, 120, 1, 2)").run();
+  await db.prepare("INSERT INTO rounds (day, player, n, qid, started_at, deadline, status, points) VALUES (300, 'old', 0, 'planets', 1, 2, 'passed', 0)").run();
   db.close();
-  const reopened = openDb(file);                       // migration runs on open
-  openDb(file).close();                                // and is idempotent
+  const reopened = await openDb(file);                 // migration runs on open
+  (await openDb(file)).close();                        // and is idempotent
   const game = createGame({ db: reopened, bank });
-  const h = game.history("old").dives;
+  const h = (await game.history("old")).dives;
   assert.equal(h.length, 1); assert.equal(h[0].modeName, "Daily Dive (legacy)"); assert.equal(h[0].score, 120); assert.equal(h[0].questions, 1);
-  assert.equal(game.review("old", h[0].id).dive.log[0].status, "passed");
+  assert.equal((await game.review("old", h[0].id)).dive.log[0].status, "passed");
   reopened.close();
 });
 
+test("concurrent requests: parallel transactions queue instead of failing", async () => {
+  const { game } = await setup();
+  const starts = await Promise.all(["a", "b", "c", "d"].map(p => game.start(p, { mode: "quick", topic: "space" })));
+  const answers = await Promise.all(starts.map((v, i) => game.answer("abcd"[i], { dive: v.dive.id, seq: v.dive.seq, text: commonFor(v) })));
+  assert.ok(answers.every(v => v.result.outcome === "accepted"));
+});
+
 // ---------- auth & limits (unchanged behaviour) ----------
-test("auth: tokens stored hashed, identities link to accounts", () => {
-  const db = openDb(":memory:"), auth = createAuth(db);
-  const { playerId, cookie } = auth.createPlayer();
+test("auth: tokens stored hashed, identities link to accounts", async () => {
+  const db = await openDb(":memory:"), auth = createAuth(db);
+  const { playerId, cookie } = await auth.createPlayer();
   const token = /sid=([a-f0-9]{32})/.exec(cookie)[1];
-  assert.equal(auth.resolve(`sid=${token}`), playerId);
-  assert.ok(!db.prepare("SELECT token_hash FROM auth_tokens").all().some(r => r.token_hash === token));
-  assert.ok(db.prepare("SELECT token_hash FROM auth_tokens").all().some(r => r.token_hash === sha256(token)));
-  auth.linkIdentity(playerId, "oidc:x", "u1");
-  assert.equal(auth.playerForIdentity("oidc:x", "u1"), playerId);
+  assert.equal(await auth.resolve(`sid=${token}`), playerId);
+  const hashes = (await db.prepare("SELECT token_hash FROM auth_tokens").all()).map(r => r.token_hash);
+  assert.ok(!hashes.includes(token)); assert.ok(hashes.includes(sha256(token)));
+  await auth.linkIdentity(playerId, "oidc:x", "u1");
+  assert.equal(await auth.playerForIdentity("oidc:x", "u1"), playerId);
+  assert.ok(!/Secure/.test(cookie), "no Secure flag locally (http)");
+  assert.ok(/; Secure/.test((await createAuth(db, { secure: true }).createPlayer()).cookie), "Secure flag on https hosts");
 });
 
 test("rate limiter blocks bursts and resets", () => {

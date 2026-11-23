@@ -58,34 +58,30 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     rarest:      db.prepare("SELECT r.* FROM dive_rounds r JOIN dives d ON d.id = r.dive WHERE d.player = ? AND r.status = 'accepted' ORDER BY r.share ASC, r.closed_at ASC LIMIT 1"),
   };
 
-  function tx(fn) {
-    db.exec("BEGIN IMMEDIATE");
-    try { const r = fn(); db.exec("COMMIT"); return r; }
-    catch (e) { db.exec("ROLLBACK"); throw e; }
-  }
+  const tx = fn => db.tx(fn);
 
   // ---------- rarity (frozen per UTC day per question) ----------
-  function frozenCounts(qid, t = now()) {
+  async function frozenCounts(qid, t = now()) {
     const day = E.dayIndex(t);
-    let s = sql.snapshot.get(day, qid);
+    let s = (await sql.snapshot.get(day, qid));
     if (!s) {
       const obj = {}; let total = 0;
-      for (const r of sql.counts.all(qid)) { obj[r.answer_id] = r.n; total += r.n; }
-      sql.addSnapshot.run(day, qid, JSON.stringify(obj), total);
-      s = sql.snapshot.get(day, qid);
+      for (const r of (await sql.counts.all(qid))) { obj[r.answer_id] = r.n; total += r.n; }
+      (await sql.addSnapshot.run(day, qid, JSON.stringify(obj), total));
+      s = (await sql.snapshot.get(day, qid));
     }
     return new Map(Object.entries(JSON.parse(s.counts)));
   }
 
   // ---------- helpers ----------
-  function recentFor(pid) {
+  async function recentFor(pid) {
     const m = new Map();
-    sql.recent.all(pid).forEach((r, i) => { if (!m.has(r.qid)) m.set(r.qid, i); });
+    (await sql.recent.all(pid)).forEach((r, i) => { if (!m.has(r.qid)) m.set(r.qid, i); });
     return m;
   }
 
-  function ownDive(pid, id) {
-    const d = typeof id === "string" ? sql.dive.get(id) : null;
+  async function ownDive(pid, id) {
+    const d = typeof id === "string" ? (await sql.dive.get(id)) : null;
     if (!d || d.player !== pid) throw new GameError(404, "no-dive", "That dive was not found.");
     return d;
   }
@@ -95,26 +91,26 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
   }
 
   /** Close an open round whose deadline (plus grace) has passed; endless dives lose an air tank. */
-  function settle(d, t = now()) {
+  async function settle(d, t = now()) {
     if (!d || d.phase !== "question") return d;
-    const r = sql.round.get(d.id, d.idx);
+    const r = (await sql.round.get(d.id, d.idx));
     if (r && r.status === "open" && t > r.deadline + E.GRACE_MS) {
-      tx(() => {
-        if (sql.closeRound.run("timeout", null, null, null, 0, null, null, t, d.id, d.idx).changes) {
+      await tx(async () => {
+        if ((await sql.closeRound.run("timeout", null, null, null, 0, null, null, t, d.id, d.idx)).changes) {
           const lives = d.lives == null ? null : Math.max(0, d.lives - 1);
-          sql.setDive.run("between", d.idx, d.seq, d.score, lives, d.qids, null, null, d.id);
+          (await sql.setDive.run("between", d.idx, d.seq, d.score, lives, d.qids, null, null, d.id));
         }
       });
-      return sql.dive.get(d.id);
+      return (await sql.dive.get(d.id));
     }
     return d;
   }
 
-  function openRound(diveId, n, qid, t, ms) { sql.addRound.run(diveId, n, qid, t, t + ms); }
+  async function openRound(diveId, n, qid, t, ms) { (await sql.addRound.run(diveId, n, qid, t, t + ms)); }
 
   // ---------- actions ----------
   /** Start a new dive immediately. Any unfinished dive is closed as abandoned. */
-  function start(pid, { mode, topic } = {}) {
+  async function start(pid, { mode, topic } = {}) {
     const M = MODES[mode];
     if (!M) throw new GameError(400, "bad-mode", "Pick a game mode.");
     if (M.topic === "required" && !topicById.has(topic)) throw new GameError(400, "bad-topic", "Pick a topic for this mode.");
@@ -122,102 +118,102 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     const useTopic = M.topic === "none" ? null : (topic ?? null);
     const t = now(), id = "d_" + crypto.randomBytes(9).toString("hex");
     const planned = M.id === "endless" ? 1 : M.rounds;
-    const qids = E.pickQuestions({ bank, mode: M.id, topic: useTopic, count: planned, recent: recentFor(pid), random });
+    const qids = E.pickQuestions({ bank, mode: M.id, topic: useTopic, count: planned, recent: await recentFor(pid), random });
     if (qids.length < planned) throw new GameError(409, "no-questions", "Not enough questions in this topic yet.");
-    tx(() => {
-      sql.abandonRnds.run(t, pid); sql.abandon.run(t, pid);
-      sql.addDive.run(id, pid, M.id, useTopic, M.lives ?? null, JSON.stringify(qids), M.questionMs, t);
-      openRound(id, 0, qids[0], t, M.questionMs);
+    await tx(async () => {
+      (await sql.abandonRnds.run(t, pid)); (await sql.abandon.run(t, pid));
+      (await sql.addDive.run(id, pid, M.id, useTopic, M.lives ?? null, JSON.stringify(qids), M.questionMs, t));
+      await openRound(id, 0, qids[0], t, M.questionMs);
     });
-    return state(pid, id);
+    return await state(pid, id);
   }
 
-  function answer(pid, { dive, seq, text }) {
+  async function answer(pid, { dive, seq, text }) {
     const t = now();
-    let d = settle(ownDive(pid, dive), t);
+    let d = await settle(await ownDive(pid, dive), t);
     const raw = String(text ?? "").trim().slice(0, MAX_ANSWER_LEN);
-    const result = tx(() => {
-      d = sql.dive.get(d.id);
+    const result = await tx(async () => {
+      d = (await sql.dive.get(d.id));
       checkSeq(d, seq);
       if (d.phase !== "question") throw new GameError(409, "closed", "This question is closed.");
-      const r = sql.round.get(d.id, d.idx);
+      const r = (await sql.round.get(d.id, d.idx));
       if (t > r.deadline + E.GRACE_MS) throw new GameError(409, "expired", "Time is up.");
       const q = questions.get(r.qid), cat = catalogs.get(r.qid);
       const m = E.match(q, cat, raw);
       if (!m.key) throw new GameError(400, "empty", "Type an answer first.");
-      if (sql.hasAttempt.get(d.id, d.idx, m.key)) return { outcome: "repeat" };
-      if (sql.attemptN.get(d.id, d.idx).c >= MAX_ATTEMPTS) throw new GameError(429, "too-many", "Too many attempts on this question.");
-      sql.addAttempt.run(d.id, d.idx, m.key, raw, m.ok ? 1 : 0, t);
-      if (!m.ok) { sql.setDive.run("question", d.idx, d.seq + 1, d.score, d.lives, d.qids, null, null, d.id); return { outcome: "rejected", reason: m.reason }; }
-      const { share, liveTotal } = E.shareOf(cat, m.entry.id, frozenCounts(r.qid, t));
+      if ((await sql.hasAttempt.get(d.id, d.idx, m.key))) return { outcome: "repeat" };
+      if ((await sql.attemptN.get(d.id, d.idx)).c >= MAX_ATTEMPTS) throw new GameError(429, "too-many", "Too many attempts on this question.");
+      (await sql.addAttempt.run(d.id, d.idx, m.key, raw, m.ok ? 1 : 0, t));
+      if (!m.ok) { (await sql.setDive.run("question", d.idx, d.seq + 1, d.score, d.lives, d.qids, null, null, d.id)); return { outcome: "rejected", reason: m.reason }; }
+      const { share, liveTotal } = E.shareOf(cat, m.entry.id, await frozenCounts(r.qid, t));
       const tier = E.tierForShare(share);
-      sql.closeRound.run("accepted", m.entry.id, raw, tier.id, tier.points, share, liveTotal, t, d.id, d.idx);
-      sql.bump.run(r.qid, m.entry.id);                    // feeds tomorrow's snapshot
-      sql.setDive.run("between", d.idx, d.seq + 1, d.score + tier.points, d.lives, d.qids, null, null, d.id);
+      (await sql.closeRound.run("accepted", m.entry.id, raw, tier.id, tier.points, share, liveTotal, t, d.id, d.idx));
+      (await sql.bump.run(r.qid, m.entry.id));                    // feeds tomorrow's snapshot
+      (await sql.setDive.run("between", d.idx, d.seq + 1, d.score + tier.points, d.lives, d.qids, null, null, d.id));
       return { outcome: "accepted", fuzzy: m.fuzzy };
     });
-    return { ...state(pid, d.id), result };
+    return { ...(await state(pid, d.id)), result };
   }
 
-  function pass(pid, { dive, seq }) {
+  async function pass(pid, { dive, seq }) {
     const t = now();
-    let d = settle(ownDive(pid, dive), t);
-    tx(() => {
-      d = sql.dive.get(d.id);
+    let d = await settle(await ownDive(pid, dive), t);
+    await tx(async () => {
+      d = (await sql.dive.get(d.id));
       checkSeq(d, seq);
       if (d.phase !== "question") throw new GameError(409, "closed", "This question is closed.");
-      sql.closeRound.run("passed", null, null, null, 0, null, null, t, d.id, d.idx);
+      (await sql.closeRound.run("passed", null, null, null, 0, null, null, t, d.id, d.idx));
       const lives = d.lives == null ? null : Math.max(0, d.lives - 1);
-      sql.setDive.run("between", d.idx, d.seq + 1, d.score, lives, d.qids, null, null, d.id);
+      (await sql.setDive.run("between", d.idx, d.seq + 1, d.score, lives, d.qids, null, null, d.id));
     });
-    return state(pid, d.id);
+    return await state(pid, d.id);
   }
 
-  function next(pid, { dive, seq }) {
+  async function next(pid, { dive, seq }) {
     const t = now();
-    let d = settle(ownDive(pid, dive), t);
-    tx(() => {
-      d = sql.dive.get(d.id);
+    let d = await settle(await ownDive(pid, dive), t);
+    await tx(async () => {
+      d = (await sql.dive.get(d.id));
       checkSeq(d, seq);
       if (d.phase !== "between") throw new GameError(409, "not-ready", "Finish this question first.");
       const M = MODES[d.mode] || MODES.quick, qids = JSON.parse(d.qids);
-      const finish = reason => sql.setDive.run("done", d.idx, d.seq + 1, d.score, d.lives, d.qids, t, reason, d.id);
+      const finish = async reason => (await sql.setDive.run("done", d.idx, d.seq + 1, d.score, d.lives, d.qids, t, reason, d.id));
       if (d.mode === "endless") {
         if (d.lives <= 0) return finish("out-of-air");
         if (d.idx + 1 >= M.rounds) return finish("complete");
         const lastTopic = questions.get(qids[qids.length - 1])?.topic;
-        const [q] = E.pickQuestions({ bank, mode: "endless", topic: d.topic, count: 1, asked: new Set(qids), recent: recentFor(pid), random, avoidTopic: d.topic ? null : lastTopic });
+        const [q] = E.pickQuestions({ bank, mode: "endless", topic: d.topic, count: 1, asked: new Set(qids), recent: await recentFor(pid), random, avoidTopic: d.topic ? null : lastTopic });
         if (!q) return finish("complete");
         qids.push(q);
       } else if (d.idx + 1 >= qids.length) return finish(d.mode === "daily" ? "legacy" : "complete");
-      openRound(d.id, d.idx + 1, qids[d.idx + 1], t, d.question_ms);
-      sql.setDive.run("question", d.idx + 1, d.seq + 1, d.score, d.lives, JSON.stringify(qids), null, null, d.id);
+      await openRound(d.id, d.idx + 1, qids[d.idx + 1], t, d.question_ms);
+      (await sql.setDive.run("question", d.idx + 1, d.seq + 1, d.score, d.lives, JSON.stringify(qids), null, null, d.id));
     });
-    return state(pid, d.id);
+    return await state(pid, d.id);
   }
 
   /** Endless only: stop diving now and keep the score. An open question closes with no penalty. */
-  function surface(pid, { dive, seq }) {
+  async function surface(pid, { dive, seq }) {
     const t = now();
-    let d = settle(ownDive(pid, dive), t);
-    tx(() => {
-      d = sql.dive.get(d.id);
+    let d = await settle(await ownDive(pid, dive), t);
+    await tx(async () => {
+      d = (await sql.dive.get(d.id));
       checkSeq(d, seq);
       if (d.mode !== "endless") throw new GameError(409, "not-endless", "Only Endless dives can surface early.");
       if (d.phase === "done") throw new GameError(409, "closed", "This dive is over.");
-      if (d.phase === "question") sql.closeRound.run("passed", null, null, null, 0, null, null, t, d.id, d.idx);
-      sql.setDive.run("done", d.idx, d.seq + 1, d.score, d.lives, d.qids, t, "surfaced", d.id);
+      if (d.phase === "question") (await sql.closeRound.run("passed", null, null, null, 0, null, null, t, d.id, d.idx));
+      (await sql.setDive.run("done", d.idx, d.seq + 1, d.score, d.lives, d.qids, t, "surfaced", d.id));
     });
-    return state(pid, d.id);
+    return await state(pid, d.id);
   }
 
   // ---------- read model ----------
   const topicName = id => topicById.get(id)?.name ?? null;
   const modeName = id => MODES[id]?.name ?? (id === "daily" ? "Daily Dive (legacy)" : id);
 
-  function roundView(r, closed) {
+  async function roundView(r, closed) {
     const q = questions.get(r.qid), cat = catalogs.get(r.qid);
-    const attempts = sql.attempts.all(r.dive, r.n);
+    const attempts = (await sql.attempts.all(r.dive, r.n));
     const out = {
       n: r.n, text: q ? q.text : "(retired question)", hint: q?.hint ?? "", topic: q?.topic ?? null, topicName: topicName(q?.topic),
       difficulty: q?.difficulty ?? null, status: r.status, startedAt: r.started_at, deadline: r.deadline,
@@ -228,16 +224,16 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
       Object.assign(out, {
         answer: entry ? entry.name : null, typed: r.answer_raw, tier: r.tier, points: r.points, closedAt: r.closed_at,
         share: r.share, liveTotal: r.live_total, explain: q.explain,
-        top: E.topAnswers(cat, frozenCounts(r.qid), 3).map(a => a.name),
+        top: E.topAnswers(cat, await frozenCounts(r.qid), 3).map(a => a.name),
       });
     }
     return out;
   }
 
   const MASTERY = [[7, "Abyss master"], [5, "Deep diver"], [3, "Reef explorer"], [1, "Snorkeller"], [0, "Still at the surface"]];
-  function diveView(d) {
+  async function diveView(d) {
     const M = MODES[d.mode];
-    const log = sql.rounds.all(d.id).map(r => roundView(r, r.status !== "open"));
+    const log = await Promise.all((await sql.rounds.all(d.id)).map(r => roundView(r, r.status !== "open")));
     const found = log.filter(r => r.status === "accepted").length;
     const out = {
       id: d.id, mode: d.mode, modeName: modeName(d.mode), topic: d.topic, topicName: topicName(d.topic),
@@ -250,13 +246,13 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     return out;
   }
 
-  function playerStats(pid) {
+  async function playerStats(pid) {
     const empty = { dives: 0, questionsAnswered: 0, accepted: 0, passed: 0, timedOut: 0, answeredRate: 0, bestScore: 0, deepest: 0,
       average: 0, totalPoints: 0, tierCounts: {}, tiersFound: [], rarest: null, favoriteTopics: [], records: {}, recent: [] };
     if (!pid) return empty;
-    const done = sql.finished.all(pid);
-    const st = Object.fromEntries(sql.statusCounts.all(pid).map(r => [r.status, r.n]));
-    const tierCounts = Object.fromEntries(sql.tierCounts.all(pid).filter(r => r.tier).map(r => [r.tier, r.n]));
+    const done = (await sql.finished.all(pid));
+    const st = Object.fromEntries((await sql.statusCounts.all(pid)).map(r => [r.status, r.n]));
+    const tierCounts = Object.fromEntries((await sql.tierCounts.all(pid)).filter(r => r.tier).map(r => [r.tier, r.n]));
     const answered = (st.accepted || 0) + (st.passed || 0) + (st.timeout || 0);
     const sevens = done.filter(d => d.mode !== "endless");
     const records = {};
@@ -270,7 +266,7 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     for (const d of done) if (d.topic) { const x = byTopic[d.topic] ??= { topic: d.topic, name: topicName(d.topic), dives: 0, total: 0, best: 0 }; x.dives++; x.total += d.score; x.best = Math.max(x.best, d.score); }
     const favoriteTopics = Object.values(byTopic).map(x => ({ ...x, average: Math.round(x.total / x.dives) }))
       .sort((a, b) => b.dives - a.dives || b.total - a.total).slice(0, 3);
-    const rr = sql.rarest.get(pid);
+    const rr = (await sql.rarest.get(pid));
     let rarest = null;
     if (rr) { const q = questions.get(rr.qid), e = q && catalogs.get(rr.qid).byId.get(rr.answer_id);
       rarest = { answer: e ? e.name : rr.answer_raw, question: q ? q.text : "", tier: rr.tier, points: rr.points, share: rr.share, dive: rr.dive }; }
@@ -286,8 +282,8 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
     };
   }
 
-  function topicsInfo() {
-    const recorded = new Map(sql.allCounts.all().map(r => [r.qid, r.n]));
+  async function topicsInfo() {
+    const recorded = new Map((await sql.allCounts.all()).map(r => [r.qid, r.n]));
     return TOPICS.map(t => {
       const qs = bank.filter(q => q.topic === t.id);
       return { ...t, questions: qs.length, answersRecorded: qs.reduce((s, q) => s + (recorded.get(q.id) || 0), 0) };
@@ -295,33 +291,33 @@ function createGame({ db, bank, now = () => Date.now(), random = secureRandom })
   }
 
   /** Full state for the client: player stats, catalogue, and the dive in focus (given id, else active). */
-  function state(pid, diveId) {
+  async function state(pid, diveId) {
     const t = now();
     let d = null;
-    if (pid && diveId) d = ownDive(pid, diveId);
-    else if (pid) d = sql.active.get(pid) || null;
-    d = settle(d, t);
+    if (pid && diveId) d = await ownDive(pid, diveId);
+    else if (pid) d = (await sql.active.get(pid)) || null;
+    d = await settle(d, t);
     return {
       serverNow: t, metresPerPoint: E.METRES_PER_POINT, graceMs: E.GRACE_MS,
       tiers: E.TIERS.map(({ id, name, points, creature }) => ({ id, name, points, creature })),
-      zones: E.ZONES, groups: GROUPS, topics: topicsInfo(), modes: Object.values(MODES),
-      player: playerStats(pid), dive: d ? diveView(d) : null,
+      zones: E.ZONES, groups: GROUPS, topics: await topicsInfo(), modes: Object.values(MODES),
+      player: await playerStats(pid), dive: d ? await diveView(d) : null,
     };
   }
 
-  function history(pid, { limit = 50 } = {}) {
+  async function history(pid, { limit = 50 } = {}) {
     if (!pid) return { dives: [] };
-    return { dives: sql.finished.all(pid).slice(0, Math.min(200, limit)).map(d => ({
+    return { dives: (await sql.finished.all(pid)).slice(0, Math.min(200, limit)).map(d => ({
       id: d.id, mode: d.mode, modeName: modeName(d.mode), topic: d.topic, topicName: topicName(d.topic),
       score: d.score, depth: E.depthFor(d.score), questions: d.n_rounds, found: d.n_found,
       startedAt: d.started_at, finishedAt: d.finished_at, endReason: d.end_reason,
     })) };
   }
 
-  function review(pid, id) {
-    const d = ownDive(pid, id);
+  async function review(pid, id) {
+    const d = await ownDive(pid, id);
     if (d.phase !== "done") throw new GameError(409, "not-done", "This dive is still in progress.");
-    return { serverNow: now(), dive: diveView(d) };
+    return { serverNow: now(), dive: await diveView(d) };
   }
 
   return { start, answer, pass, next, surface, state, history, review, GameError };

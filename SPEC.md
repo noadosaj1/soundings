@@ -85,6 +85,16 @@ Result: about 22% of answers move one tier, 9 move two, and about a third are ig
 Frequency data: Google Books Ngram Viewer; wordfreq by Robyn Speer (doi.org/10.5281/zenodo.7199437), data CC BY-SA 4.0.
 Players are anonymous (cookie). Clearing cookies or switching browsers = a new player; one-attempt-per-day holds per cookie, not per person (needs accounts to go further).
 
+## Deploy (Vercel + Turso)
+Vercel serves `public/` as static files. Every `/api/*` request is rewritten to one serverless function, `api/index.js`, which runs the same handler as `npm start`.
+
+Vercel has no lasting disk, so the database is Turso (hosted libSQL/SQLite). Tables are created on the first request.
+1. Create a database at turso.tech, then copy its URL (`libsql://…`) and an auth token.
+2. In Vercel, open Project → Settings → Environment Variables. Add `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` for Production (and Preview if wanted).
+3. Redeploy.
+
+Without these variables, the API answers 503 "The server database is not set up yet." Locally, nothing is needed: the database is the file `data/soundings.db`. Set the two variables to use Turso locally instead.
+
 ## Production-readiness upgrade
 - **Frozen daily rarity**: when a day is first served, each of its questions' `answer_counts` are copied to `rarity_snapshot`; all scoring and "most common answers" that day read the snapshot. Same answer = same tier for every player all day. Today's answers only move future days.
 - **Question bank**: 56 questions in 14 categories (`server/questions.js` + `server/questions-more.js`). Schedule: seeded 8-day cycles, every question once per cycle, max 2 per category per dive.

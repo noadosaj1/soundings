@@ -16,7 +16,7 @@ const TOKEN_RE = /^[a-f0-9]{32}$/;
 const sha256 = s => crypto.createHash("sha256").update(s).digest("hex");
 const randomHex = bytes => crypto.randomBytes(bytes).toString("hex");
 
-function createAuth(db, { now = () => Date.now() } = {}) {
+function createAuth(db, { now = () => Date.now(), secure = false } = {}) {
   const sql = {
     token:      db.prepare("SELECT player FROM auth_tokens WHERE token_hash = ?"),
     touch:      db.prepare("UPDATE auth_tokens SET last_seen = ? WHERE token_hash = ?"),
@@ -35,50 +35,50 @@ function createAuth(db, { now = () => Date.now() } = {}) {
   }
 
   /** Player id for a request's cookie, or null. Migrates pre-hashing cookies (token == player id). */
-  function resolve(cookieHeader) {
+  async function resolve(cookieHeader) {
     const token = tokenFromCookie(cookieHeader);
     if (!token) return null;
     const h = sha256(token), t = now();
-    const row = sql.token.get(h);
-    if (row) { sql.touch.run(t, h); return row.player; }
-    if (sql.player.get(token)) { sql.addToken.run(h, token, t, t); return token; }   // legacy cookie
+    const row = await sql.token.get(h);
+    if (row) { await sql.touch.run(t, h); return row.player; }
+    if (await sql.player.get(token)) { await sql.addToken.run(h, token, t, t); return token; }   // legacy cookie
     return null;
   }
 
   /** Create a new anonymous player plus a token; returns { playerId, cookie }. */
-  function createPlayer() {
+  async function createPlayer() {
     const id = "p_" + randomHex(12), token = randomHex(16), t = now();
-    sql.addPlayer.run(id, t);
-    sql.addToken.run(sha256(token), id, t, t);
+    await sql.addPlayer.run(id, t);
+    await sql.addToken.run(sha256(token), id, t, t);
     return { playerId: id, cookie: cookieFor(token) };
   }
 
   /** Issue an extra token for an existing player (e.g. after a future login). */
-  function issueToken(playerId) {
+  async function issueToken(playerId) {
     const token = randomHex(16), t = now();
-    sql.addToken.run(sha256(token), playerId, t, t);
+    await sql.addToken.run(sha256(token), playerId, t, t);
     return cookieFor(token);
   }
 
   function cookieFor(token) {
-    return `${COOKIE}=${token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict`;
+    return `${COOKIE}=${token}; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict${secure ? "; Secure" : ""}`;
   }
 
   /** Attach an external identity to the player's account (creating the account if needed). */
-  function linkIdentity(playerId, provider, subject, displayName = null) {
+  async function linkIdentity(playerId, provider, subject, displayName = null) {
     if (!provider || !subject) throw new Error("provider and subject required");
-    if (sql.identity.get(provider, String(subject))) throw new Error("identity already linked");
-    const p = sql.player.get(playerId);
+    if (await sql.identity.get(provider, String(subject))) throw new Error("identity already linked");
+    const p = await sql.player.get(playerId);
     if (!p) throw new Error("unknown player");
     const t = now();
     let account = p.account_id;
-    if (!account) { account = "a_" + randomHex(12); sql.addAccount.run(account, t, displayName); sql.setAccount.run(account, playerId); }
-    sql.addIdent.run(provider, String(subject), account, t);
+    if (!account) { account = "a_" + randomHex(12); await sql.addAccount.run(account, t, displayName); await sql.setAccount.run(account, playerId); }
+    await sql.addIdent.run(provider, String(subject), account, t);
     return account;
   }
 
-  function playerForIdentity(provider, subject) {
-    const row = sql.identity.get(provider, String(subject));
+  async function playerForIdentity(provider, subject) {
+    const row = await sql.identity.get(provider, String(subject));
     return row ? row.player : null;
   }
 

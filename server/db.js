@@ -1,15 +1,19 @@
 "use strict";
+/*
+ * Database: libSQL (SQLite). Locally a file (data/soundings.db) or ":memory:"; in production a
+ * Turso database (TURSO_DATABASE_URL + TURSO_AUTH_TOKEN), because serverless hosts such as Vercel
+ * have no disk that survives between requests.
+ *
+ * The returned object keeps a prepared-statement style API, but every call is async:
+ *   await db.prepare(sql).get(...args) / .all(...args) / .run(...args) -> { changes }
+ *   await db.tx(async () => { ... })    statements inside run in one write transaction
+ */
 const fs = require("node:fs");
 const path = require("node:path");
-const { DatabaseSync } = require("node:sqlite");
+const { AsyncLocalStorage } = require("node:async_hooks");
+const { createClient } = require("@libsql/client");
 
-/** Opens (and migrates) the Soundings database. One file, one process. */
-function openDb(file) {
-  if (file !== ":memory:") fs.mkdirSync(path.dirname(file), { recursive: true });
-  const db = new DatabaseSync(file);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    PRAGMA foreign_keys = ON;
+const SCHEMA = `
     CREATE TABLE IF NOT EXISTS players (
       id          TEXT PRIMARY KEY,
       created_at  INTEGER NOT NULL
@@ -145,21 +149,82 @@ function openDb(file) {
     CREATE INDEX IF NOT EXISTS dive_rounds_qid ON dive_rounds(qid);
     CREATE INDEX IF NOT EXISTS sessions_player ON sessions(player, day);
     CREATE INDEX IF NOT EXISTS rounds_player ON rounds(player, status);
-  `);
+`;
+
+const MIGRATE_LEGACY = `
+  INSERT OR IGNORE INTO dives (id, player, mode, topic, phase, idx, seq, score, lives, qids, question_ms, started_at, finished_at, end_reason)
+    SELECT 'legacy-' || day || '-' || player, player, 'daily', NULL, 'done', idx, seq, score, NULL,
+           (SELECT json_group_array(qid) FROM (SELECT qid FROM rounds r WHERE r.day = s.day AND r.player = s.player ORDER BY n)),
+           25000, started_at, finished_at, 'legacy'
+    FROM sessions s WHERE phase = 'done';
+  INSERT OR IGNORE INTO dive_rounds (dive, n, qid, started_at, deadline, status, answer_id, answer_raw, tier, points, share, live_total, closed_at)
+    SELECT 'legacy-' || r.day || '-' || r.player, n, qid, r.started_at, deadline, status, answer_id, answer_raw, tier, points, share, live_total, closed_at
+    FROM rounds r JOIN sessions s ON s.day = r.day AND s.player = r.player WHERE s.phase = 'done';
+`;
+
+/**
+ * Opens (and migrates) the Soundings database.
+ * target: ":memory:", a file path, or a libsql:// / https:// URL (Turso; pass authToken).
+ */
+async function openDb(target = ":memory:", { authToken } = {}) {
+  const remote = /^(libsql|https?|wss?):/.test(target);
+  let url = target;
+  if (!remote && target !== ":memory:") {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    url = "file:" + target.split(path.sep).join("/");
+  }
+  const client = createClient({ url, authToken });
+
+  // Statements inside db.tx() run on the transaction; everything else on the client.
+  // One write transaction at a time per process, so concurrent requests queue instead of
+  // failing with SQLITE_BUSY on a local file (Turso serialises writes across instances itself).
+  // Queries outside a transaction wait for an open one: a ":memory:" database has one connection.
+  let queue = Promise.resolve();
+  const scope = new AsyncLocalStorage();
+  async function exec(sql, args) {
+    const t = scope.getStore();
+    if (!t) await queue;
+    return (t || client).execute({ sql, args: args.map(a => (a === undefined ? null : a)) });
+  }
+
+  async function tx(fn) {
+    const prev = queue; let release;
+    queue = new Promise(r => (release = r));
+    await prev;
+    const t = await client.transaction("write");
+    try {
+      const result = await scope.run(t, fn);
+      await t.commit();
+      return result;
+    } catch (e) {
+      await t.rollback().catch(() => {});
+      throw e;
+    } finally {
+      t.close();
+      release();
+    }
+  }
+
+  const db = {
+    remote,
+    prepare: sql => ({
+      get: async (...args) => (await exec(sql, args)).rows[0],
+      all: async (...args) => (await exec(sql, args)).rows,
+      run: async (...args) => ({ changes: (await exec(sql, args)).rowsAffected }),
+    }),
+    exec: sql => client.executeMultiple(sql),
+    tx,
+    close: () => client.close(),
+  };
+
+  if (!remote && target !== ":memory:") await client.execute("PRAGMA journal_mode = WAL");
+  await client.execute("PRAGMA foreign_keys = ON");
+  await db.exec(SCHEMA);
   // additive migration for databases created before accounts existed
-  const cols = db.prepare("PRAGMA table_info(players)").all().map(c => c.name);
-  if (!cols.includes("account_id")) db.exec("ALTER TABLE players ADD COLUMN account_id TEXT REFERENCES accounts(id)");
+  const cols = (await db.prepare("PRAGMA table_info(players)").all()).map(c => c.name);
+  if (!cols.includes("account_id")) await db.exec("ALTER TABLE players ADD COLUMN account_id TEXT REFERENCES accounts(id)");
   // one-time carry-over of finished daily dives into the unlimited dive history
-  db.exec(`
-    INSERT OR IGNORE INTO dives (id, player, mode, topic, phase, idx, seq, score, lives, qids, question_ms, started_at, finished_at, end_reason)
-      SELECT 'legacy-' || day || '-' || player, player, 'daily', NULL, 'done', idx, seq, score, NULL,
-             (SELECT json_group_array(qid) FROM (SELECT qid FROM rounds r WHERE r.day = s.day AND r.player = s.player ORDER BY n)),
-             25000, started_at, finished_at, 'legacy'
-      FROM sessions s WHERE phase = 'done';
-    INSERT OR IGNORE INTO dive_rounds (dive, n, qid, started_at, deadline, status, answer_id, answer_raw, tier, points, share, live_total, closed_at)
-      SELECT 'legacy-' || r.day || '-' || r.player, n, qid, r.started_at, deadline, status, answer_id, answer_raw, tier, points, share, live_total, closed_at
-      FROM rounds r JOIN sessions s ON s.day = r.day AND s.player = r.player WHERE s.phase = 'done';
-  `);
+  await db.exec(MIGRATE_LEGACY);
   return db;
 }
 

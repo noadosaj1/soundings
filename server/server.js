@@ -1,9 +1,13 @@
 "use strict";
 /*
- * Soundings HTTP server: JSON API + static files from /public. No dependencies.
- *   PORT        (default 8765)
- *   DB_PATH     (default data/soundings.db)
- *   TRUST_PROXY ("1" to take the client IP from X-Forwarded-For behind a reverse proxy)
+ * Soundings HTTP server: JSON API + static files from /public.
+ * Run locally with `npm start`; on Vercel, api/index.js uses createHandler() (static files are
+ * served by Vercel from /public).
+ *   PORT                (default 8765)
+ *   DB_PATH             (default data/soundings.db; local file)
+ *   TURSO_DATABASE_URL  (libsql://… — use a Turso database instead of the file; required on Vercel)
+ *   TURSO_AUTH_TOKEN    (token for that database)
+ *   TRUST_PROXY         ("1" to take the client IP from X-Forwarded-For; automatic on Vercel)
  */
 const http = require("node:http");
 const fs = require("node:fs");
@@ -17,11 +21,20 @@ const ROOT = path.join(__dirname, "..");
 const PUBLIC = path.join(ROOT, "public");
 const PORT = Number(process.env.PORT) || 8765;
 const DB_PATH = process.env.DB_PATH || path.join(ROOT, "data", "soundings.db");
-const TRUST_PROXY = process.env.TRUST_PROXY === "1";
+const ON_VERCEL = !!process.env.VERCEL;
+const TRUST_PROXY = process.env.TRUST_PROXY === "1" || ON_VERCEL;
 
-const db = openDb(DB_PATH);
-const game = createGame({ db, bank });
-const auth = createAuth(db);
+let game, auth;
+/** Opens the database once per process (one cold start on Vercel). */
+const ready = (async () => {
+  const url = process.env.TURSO_DATABASE_URL;
+  if (ON_VERCEL && !url) throw new Error("TURSO_DATABASE_URL is not set: Vercel has no disk, so Soundings needs a Turso database.");
+  const db = await openDb(url || DB_PATH, { authToken: process.env.TURSO_AUTH_TOKEN });
+  game = createGame({ db, bank });
+  auth = createAuth(db, { secure: ON_VERCEL });
+})();
+ready.catch(e => console.error("database:", e.message));
+
 // Abuse limits (per client IP, in memory). Generous for people, tight for scripts.
 const limitWrites = createLimiter({ limit: Number(process.env.RL_WRITES) || 40, windowMs: 10_000 });
 const limitReads = createLimiter({ limit: Number(process.env.RL_READS) || 120, windowMs: 10_000 });
@@ -84,8 +97,9 @@ async function api(req, res, route) {
   const ip = clientIp(req);
   let pid = null, body = {}; const headers = {};
   try {
+    try { await ready; } catch (e) { throw new GameError(503, "no-database", "The server database is not set up yet."); }
     if (!(req.method === "GET" ? limitReads(ip) : limitWrites(ip))) throw new GameError(429, "rate-limited", "Too many requests — slow down a little.");
-    pid = auth.resolve(req.headers.cookie);
+    pid = await auth.resolve(req.headers.cookie);
     if (req.method === "POST") {
       // JSON-only + same-origin check: blocks cross-site form posts riding the cookie.
       if (!/^application\/json/.test(req.headers["content-type"] || "")) throw new GameError(415, "json-only", "JSON required.");
@@ -97,13 +111,13 @@ async function api(req, res, route) {
     if (action.needsPlayer && !pid) {
       if (action.needsPlayer !== "create") throw new GameError(409, "no-session", "Start a dive first.");
       if (!limitNewPlayers(ip)) throw new GameError(429, "rate-limited", "Too many new divers from this network. Try again later.");
-      const p = auth.createPlayer(); pid = p.playerId; headers["Set-Cookie"] = p.cookie;
+      const p = await auth.createPlayer(); pid = p.playerId; headers["Set-Cookie"] = p.cookie;
     }
-    sendJson(res, 200, action.fn(pid, body), headers);
+    sendJson(res, 200, await action.fn(pid, body), headers);
   } catch (e) {
     if (!(e instanceof GameError)) { console.error(e); e = new GameError(500, "server", "Something went wrong."); }
     let state;
-    if (e.status !== 429 && pid) { try { state = game.state(pid, typeof body.dive === "string" ? body.dive : undefined); } catch { try { state = game.state(pid); } catch {} } }
+    if (e.status !== 429 && pid) { try { state = await game.state(pid, typeof body.dive === "string" ? body.dive : undefined); } catch { try { state = await game.state(pid); } catch {} } }
     sendJson(res, e.status, { error: e.code, message: e.message, state }, e.status === 429 ? { ...headers, "Retry-After": "10" } : headers);
   }
 }
@@ -119,12 +133,16 @@ function serveStatic(req, res, route) {
   });
 }
 
-const server = http.createServer((req, res) => {
+function handler(req, res) {
   let route;
   try { route = new URL(req.url, "http://x").pathname; } catch { return send(res, 400, "Bad request"); }
-  if (route.startsWith("/api/")) api(req, res, route);
-  else serveStatic(req, res, route);
-});
+  if (route.startsWith("/api/")) return api(req, res, route);
+  return serveStatic(req, res, route);
+}
+module.exports = { handler };
+if (require.main !== module) return;
+
+const server = http.createServer(handler);
 server.requestTimeout = 10_000;    // slow-body clients
 server.headersTimeout = 8_000;     // slow-header clients
 server.keepAliveTimeout = 5_000;
@@ -136,5 +154,4 @@ server.on("error", e => {
   }
   throw e;
 });
-server.listen(PORT, () => console.log(`Soundings listening on http://localhost:${PORT} (db: ${DB_PATH})`));
-module.exports = server;
+server.listen(PORT, () => console.log(`Soundings listening on http://localhost:${PORT} (db: ${process.env.TURSO_DATABASE_URL ? "Turso" : DB_PATH})`));
